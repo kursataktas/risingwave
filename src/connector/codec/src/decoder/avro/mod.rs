@@ -18,7 +18,6 @@ use std::sync::LazyLock;
 use apache_avro::schema::{DecimalSchema, RecordSchema, UnionSchema};
 use apache_avro::types::{Value, ValueKind};
 use apache_avro::{Decimal as AvroDecimal, Schema};
-use chrono::Datelike;
 use itertools::Itertools;
 use num_bigint::{BigInt, Sign};
 use risingwave_common::array::{ListValue, StructValue};
@@ -42,10 +41,10 @@ pub struct AvroParseOptions<'a> {
     ///
     /// FIXME: In theory we should use resolved schema.
     /// e.g., it's possible that a field is a reference to a decimal or a record containing a decimal field.
-    pub schema: Option<&'a Schema>,
+    schema: Option<&'a Schema>,
     /// Strict Mode
     /// If strict mode is disabled, an int64 can be parsed from an `AvroInt` (int32) value.
-    pub relax_numeric: bool,
+    relax_numeric: bool,
 }
 
 impl<'a> AvroParseOptions<'a> {
@@ -86,7 +85,7 @@ impl<'a> AvroParseOptions<'a> {
     ///    `type_expected`, converting the value if possible.
     /// - If only value is provided (without schema and `type_expected`),
     ///     the `DataType` will be inferred.
-    pub fn convert_to_datum<'b>(
+    fn convert_to_datum<'b>(
         &self,
         value: &'b Value,
         type_expected: &DataType,
@@ -232,11 +231,9 @@ impl<'a> AvroParseOptions<'a> {
                 .map_err(|_| create_error())?
                 .into(),
             // ---- Date -----
-            (DataType::Date, Value::Date(days)) => {
-                Date::with_days_since_ce(days + unix_epoch_days())
-                    .map_err(|_| create_error())?
-                    .into()
-            }
+            (DataType::Date, Value::Date(days)) => Date::with_days_since_unix_epoch(*days)
+                .map_err(|_| create_error())?
+                .into(),
             // ---- Varchar -----
             (DataType::Varchar, Value::Enum(_, symbol)) => borrowed!(symbol.as_str()),
             (DataType::Varchar, Value::String(s)) => borrowed!(s.as_str()),
@@ -495,10 +492,6 @@ pub fn avro_extract_field_schema<'a>(
         Schema::Map(schema) => Ok(schema),
         _ => bail!("avro schema does not have inner item, schema: {:?}", schema),
     }
-}
-
-pub(crate) fn unix_epoch_days() -> i32 {
-    Date::from_ymd_uncheck(1970, 1, 1).0.num_days_from_ce()
 }
 
 pub(crate) fn avro_to_jsonb(avro: &Value, builder: &mut jsonbb::Builder) -> AccessResult<()> {
