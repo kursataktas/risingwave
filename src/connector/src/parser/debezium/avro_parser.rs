@@ -162,18 +162,24 @@ impl DebeziumAvroParserConfig {
         // See <https://debezium.io/documentation/reference/stable/connectors/mysql.html#mysql-events>
 
         avro_schema_to_column_descs(
-            avro_schema_skip_nullable_union(avro_extract_field_schema(
-                // FIXME: use resolved schema here.
-                // Currently it works because "after" refers to a subtree in "before",
-                // but in theory, inside "before" there could also be a reference.
-                &self.outer_schema,
-                Some("before"),
-            )?)?,
+            avro_schema_skip_nullable_union(foo(&self.outer_schema)?)?,
             // TODO: do we need to support map type here?
             None,
         )
         .map_err(Into::into)
     }
+}
+
+fn foo(schema: &Schema) -> anyhow::Result<&Schema> {
+    let Schema::Record(record) = schema else {
+        unreachable!()
+    };
+    avro_extract_field_schema(
+        // FIXME: use resolved schema here.
+        // Currently it works because "after" refers to a subtree in "before",
+        // but in theory, inside "before" there could also be a reference.
+        record, "before",
+    )
 }
 
 #[cfg(test)]
@@ -264,10 +270,8 @@ mod tests {
 
         let outer_schema = get_outer_schema();
         let expected_inner_schema = Schema::parse_str(inner_shema_str).unwrap();
-        let extracted_inner_schema = avro_schema_skip_nullable_union(
-            avro_extract_field_schema(&outer_schema, Some("before")).unwrap(),
-        )
-        .unwrap();
+        let extracted_inner_schema =
+            avro_schema_skip_nullable_union(foo(&outer_schema).unwrap()).unwrap();
         assert_eq!(&expected_inner_schema, extracted_inner_schema);
     }
 
@@ -355,10 +359,7 @@ mod tests {
     fn test_map_to_columns() {
         let outer_schema = get_outer_schema();
         let columns = avro_schema_to_column_descs(
-            avro_schema_skip_nullable_union(
-                avro_extract_field_schema(&outer_schema, Some("before")).unwrap(),
-            )
-            .unwrap(),
+            avro_schema_skip_nullable_union(foo(&outer_schema).unwrap()).unwrap(),
             None,
         )
         .unwrap()

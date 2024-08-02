@@ -13,7 +13,6 @@
 // limitations under the License.
 
 mod schema;
-use std::sync::LazyLock;
 
 use apache_avro::schema::{DecimalSchema, RecordSchema, UnionSchema};
 use apache_avro::types::{Value, ValueKind};
@@ -21,8 +20,6 @@ use apache_avro::{Decimal as AvroDecimal, Schema};
 use itertools::Itertools;
 use num_bigint::{BigInt, Sign};
 use risingwave_common::array::{ListValue, StructValue};
-use risingwave_common::bail;
-use risingwave_common::log::LogSuppresser;
 use risingwave_common::types::{
     DataType, Date, DatumCow, Interval, JsonbVal, MapValue, ScalarImpl, Time, Timestamp,
     Timestamptz, ToOwnedDatum,
@@ -57,21 +54,6 @@ impl<'a> AvroParseOptions<'a> {
 }
 
 impl<'a> AvroParseOptions<'a> {
-    fn extract_inner_schema(&self, key: Option<&str>) -> Option<&'a Schema> {
-        self.schema
-            .map(|schema| avro_extract_field_schema(schema, key))
-            .transpose()
-            .map_err(|_err| {
-                static LOG_SUPPERSSER: LazyLock<LogSuppresser> =
-                    LazyLock::new(LogSuppresser::default);
-                if let Ok(suppressed_count) = LOG_SUPPERSSER.check() {
-                    tracing::error!(suppressed_count, "extract sub-schema");
-                }
-            })
-            .ok()
-            .flatten()
-    }
-
     /// Parse an avro value into expected type.
     ///
     /// 3 kinds of type info are used to parsing:
@@ -153,7 +135,7 @@ impl<'a> AvroParseOptions<'a> {
             }
             // nullable Union ([null, T])
             (_, Value::Union(_, v)) => {
-                let schema = self.extract_inner_schema(None);
+                let schema = avro_schema_skip_nullable_union(self.schema.unwrap()).ok();
                 return Self {
                     schema,
                     relax_numeric: self.relax_numeric,
@@ -270,7 +252,11 @@ impl<'a> AvroParseOptions<'a> {
                     .map(|(field_name, field_type)| {
                         let maybe_value = descs.iter().find(|(k, _v)| k == field_name);
                         if let Some((_, value)) = maybe_value {
-                            let schema = self.extract_inner_schema(Some(field_name));
+                            let Schema::Record(record_schema) = &self.schema.unwrap() else {
+                                unreachable!()
+                            };
+
+                            let schema = avro_extract_field_schema(record_schema, field_name).ok();
                             Ok(Self {
                                 schema,
                                 relax_numeric: self.relax_numeric,
@@ -286,7 +272,11 @@ impl<'a> AvroParseOptions<'a> {
             .into(),
             // ---- List -----
             (DataType::List(item_type), Value::Array(array)) => ListValue::new({
-                let schema = self.extract_inner_schema(None);
+                let Schema::Array(schema) = self.schema.unwrap() else {
+                    unreachable!()
+                };
+                use std::ops::Deref as _;
+                let schema = Some(schema.deref());
                 let mut builder = item_type.create_array_builder(array.len());
                 for v in array {
                     let value = Self {
@@ -402,13 +392,17 @@ impl Access for AvroAccess<'_> {
                     // },
                     // ...]
                     value = v;
-                    options.schema = options.extract_inner_schema(None);
+                    options.schema = avro_schema_skip_nullable_union(options.schema.unwrap()).ok();
                     continue;
                 }
                 Value::Record(fields) => {
                     if let Some((_, v)) = fields.iter().find(|(k, _)| k == key) {
                         value = v;
-                        options.schema = options.extract_inner_schema(Some(key));
+
+                        let Schema::Record(record_schema) = options.schema.unwrap() else {
+                            unreachable!()
+                        };
+                        options.schema = avro_extract_field_schema(record_schema, key).ok();
                         i += 1;
                         continue;
                     }
@@ -468,30 +462,18 @@ pub fn avro_schema_skip_nullable_union(schema: &Schema) -> anyhow::Result<&Schem
     }
 }
 
-// extract inner filed/item schema of record/array/union
 pub fn avro_extract_field_schema<'a>(
-    schema: &'a Schema,
-    name: Option<&str>,
+    schema: &'a RecordSchema,
+    name: &str,
 ) -> anyhow::Result<&'a Schema> {
-    match schema {
-        Schema::Record(RecordSchema { fields, lookup, .. }) => {
-            let name =
-                name.ok_or_else(|| anyhow::format_err!("no name provided for a field in record"))?;
-            let index = lookup.get(name).ok_or_else(|| {
-                anyhow::format_err!("no field named '{}' in record: {:?}", name, schema)
-            })?;
-            let field = fields
-                .get(*index)
-                .ok_or_else(|| anyhow::format_err!("illegal avro record schema {:?}", schema))?;
-            Ok(&field.schema)
-        }
-        Schema::Array(schema) => Ok(schema),
-        // Only nullable union should be handled here.
-        // We will not extract inner schema for real union (and it's not extractable).
-        Schema::Union(_) => avro_schema_skip_nullable_union(schema),
-        Schema::Map(schema) => Ok(schema),
-        _ => bail!("avro schema does not have inner item, schema: {:?}", schema),
-    }
+    let RecordSchema { fields, lookup, .. } = schema;
+    let index = lookup
+        .get(name)
+        .ok_or_else(|| anyhow::format_err!("no field named '{}' in record: {:?}", name, schema))?;
+    let field = fields
+        .get(*index)
+        .ok_or_else(|| anyhow::format_err!("illegal avro record schema {:?}", schema))?;
+    Ok(&field.schema)
 }
 
 pub(crate) fn avro_to_jsonb(avro: &Value, builder: &mut jsonbb::Builder) -> AccessResult<()> {
