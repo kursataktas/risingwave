@@ -38,7 +38,7 @@ pub struct AvroParseOptions<'a> {
     ///
     /// FIXME: In theory we should use resolved schema.
     /// e.g., it's possible that a field is a reference to a decimal or a record containing a decimal field.
-    schema: Option<&'a Schema>,
+    schema: &'a Schema,
     /// Strict Mode
     /// If strict mode is disabled, an int64 can be parsed from an `AvroInt` (int32) value.
     relax_numeric: bool,
@@ -47,7 +47,7 @@ pub struct AvroParseOptions<'a> {
 impl<'a> AvroParseOptions<'a> {
     pub fn create(schema: &'a Schema) -> Self {
         Self {
-            schema: Some(schema),
+            schema,
             relax_numeric: true,
         }
     }
@@ -91,7 +91,7 @@ impl<'a> AvroParseOptions<'a> {
             (_, Value::Null) => return Ok(DatumCow::NULL),
             // ---- Union (with >=2 non null variants), and nullable Union ([null, record]) -----
             (DataType::Struct(struct_type_info), Value::Union(variant, v)) => {
-                let Some(Schema::Union(u)) = self.schema else {
+                let Schema::Union(u) = self.schema else {
                     // XXX: Is this branch actually unreachable? (if self.schema is correctly used)
                     return Err(create_error());
                 };
@@ -99,7 +99,7 @@ impl<'a> AvroParseOptions<'a> {
                 if let Some(inner) = get_nullable_union_inner(u) {
                     // nullable Union ([null, record])
                     return Self {
-                        schema: Some(inner),
+                        schema: inner,
                         relax_numeric: self.relax_numeric,
                     }
                     .convert_to_datum(v, type_expected);
@@ -120,7 +120,7 @@ impl<'a> AvroParseOptions<'a> {
                 for (field_name, field_type) in struct_type_info.iter() {
                     if field_name == expected_field_name {
                         let datum = Self {
-                            schema: Some(variant_schema),
+                            schema: variant_schema,
                             relax_numeric: self.relax_numeric,
                         }
                         .convert_to_datum(v, field_type)?
@@ -135,7 +135,7 @@ impl<'a> AvroParseOptions<'a> {
             }
             // nullable Union ([null, T])
             (_, Value::Union(_, v)) => {
-                let schema = avro_schema_skip_nullable_union(self.schema.unwrap()).ok();
+                let schema = avro_schema_skip_nullable_union(self.schema).unwrap();
                 return Self {
                     schema,
                     relax_numeric: self.relax_numeric,
@@ -163,9 +163,9 @@ impl<'a> AvroParseOptions<'a> {
             // ---- Decimal -----
             (DataType::Decimal, Value::Decimal(avro_decimal)) => {
                 let (precision, scale) = match self.schema {
-                    Some(Schema::Decimal(DecimalSchema {
+                    Schema::Decimal(DecimalSchema {
                         precision, scale, ..
-                    })) => (*precision, *scale),
+                    }) => (*precision, *scale),
                     _ => Err(create_error())?,
                 };
                 let decimal = avro_decimal_to_rust_decimal(avro_decimal.clone(), precision, scale)
@@ -252,11 +252,12 @@ impl<'a> AvroParseOptions<'a> {
                     .map(|(field_name, field_type)| {
                         let maybe_value = descs.iter().find(|(k, _v)| k == field_name);
                         if let Some((_, value)) = maybe_value {
-                            let Schema::Record(record_schema) = &self.schema.unwrap() else {
+                            let Schema::Record(record_schema) = &self.schema else {
                                 unreachable!()
                             };
 
-                            let schema = avro_extract_field_schema(record_schema, field_name).ok();
+                            let schema =
+                                avro_extract_field_schema(record_schema, field_name).unwrap();
                             Ok(Self {
                                 schema,
                                 relax_numeric: self.relax_numeric,
@@ -272,11 +273,11 @@ impl<'a> AvroParseOptions<'a> {
             .into(),
             // ---- List -----
             (DataType::List(item_type), Value::Array(array)) => ListValue::new({
-                let Schema::Array(schema) = self.schema.unwrap() else {
+                let Schema::Array(schema) = self.schema else {
                     unreachable!()
                 };
                 use std::ops::Deref as _;
-                let schema = Some(schema.deref());
+                let schema = schema.deref();
                 let mut builder = item_type.create_array_builder(array.len());
                 for v in array {
                     let value = Self {
@@ -392,17 +393,17 @@ impl Access for AvroAccess<'_> {
                     // },
                     // ...]
                     value = v;
-                    options.schema = avro_schema_skip_nullable_union(options.schema.unwrap()).ok();
+                    options.schema = avro_schema_skip_nullable_union(options.schema).unwrap();
                     continue;
                 }
                 Value::Record(fields) => {
                     if let Some((_, v)) = fields.iter().find(|(k, _)| k == key) {
                         value = v;
 
-                        let Schema::Record(record_schema) = options.schema.unwrap() else {
+                        let Schema::Record(record_schema) = options.schema else {
                             unreachable!()
                         };
-                        options.schema = avro_extract_field_schema(record_schema, key).ok();
+                        options.schema = avro_extract_field_schema(record_schema, key).unwrap();
                         i += 1;
                         continue;
                     }
