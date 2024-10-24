@@ -1108,6 +1108,7 @@ impl DdlController {
         }
     }
 
+    /// `target_replace_info`: when dropping a sink into table, we need to replace the table.
     pub async fn drop_object(
         &self,
         object_type: ObjectType,
