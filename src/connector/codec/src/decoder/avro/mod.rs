@@ -304,7 +304,10 @@ impl<'a> AvroParseOptions<'a> {
                 uuid.as_hyphenated().to_string().into_boxed_str().into()
             }
             (DataType::Map(map_type), Value::Map(map)) => {
-                let schema = self.extract_inner_schema(None);
+                let schema = match self.schema {
+                    Schema::Map(val_schema) => val_schema,
+                    _ => unreachable!(),
+                };
                 let mut builder = map_type
                     .clone()
                     .into_struct()
