@@ -387,6 +387,9 @@ pub struct StreamingClusterInfo {
     /// All **active** compute nodes in the cluster.
     pub worker_nodes: HashMap<u32, WorkerNode>,
 
+    /// All schedulable compute nodes in the cluster.
+    pub schedulable_workers: HashSet<u32>,
+
     /// All unschedulable compute nodes in the cluster.
     pub unschedulable_workers: HashSet<u32>,
 }
@@ -908,7 +911,7 @@ impl ClusterControllerInner {
     pub async fn get_streaming_cluster_info(&self) -> MetaResult<StreamingClusterInfo> {
         let mut streaming_workers = self.list_active_streaming_workers().await?;
 
-        let unschedulable_workers = streaming_workers
+        let unschedulable_workers: HashSet<_> = streaming_workers
             .extract_if(|worker| {
                 worker
                     .property
@@ -918,11 +921,18 @@ impl ClusterControllerInner {
             .map(|w| w.id)
             .collect();
 
+        let schedulable_workers = streaming_workers
+            .iter()
+            .map(|worker| worker.id)
+            .filter(|id| unschedulable_workers.contains(id))
+            .collect();
+
         let active_workers: HashMap<_, _> =
             streaming_workers.into_iter().map(|w| (w.id, w)).collect();
 
         Ok(StreamingClusterInfo {
             worker_nodes: active_workers,
+            schedulable_workers,
             unschedulable_workers,
         })
     }

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,6 +29,7 @@ use risingwave_common::util::column_index_mapping::ColIndexMapping;
 use risingwave_common::util::stream_graph_visitor::{
     visit_fragment, visit_stream_node, visit_stream_node_cont_mut,
 };
+use risingwave_common::util::worker_util::DEFAULT_COMPUTE_NODE_LABEL;
 use risingwave_common::{bail, hash, must_match};
 use risingwave_connector::error::ConnectorError;
 use risingwave_connector::source::{
@@ -43,8 +44,8 @@ use risingwave_meta_model::{
 use risingwave_pb::catalog::source::OptionalAssociatedTableId;
 use risingwave_pb::catalog::table::OptionalAssociatedSourceId;
 use risingwave_pb::catalog::{
-    Comment, Connection, CreateType, Database, Function, PbSink, PbSource, PbTable, Schema, Secret,
-    Sink, Source, Subscription, Table, View,
+    BackfillType, Comment, Connection, CreateType, Database, Function, PbSink, PbSource, PbTable,
+    Schema, Secret, Sink, Source, Subscription, Table, View,
 };
 use risingwave_pb::ddl_service::alter_owner_request::Object;
 use risingwave_pb::ddl_service::{
@@ -62,6 +63,7 @@ use risingwave_pb::stream_plan::{
 use thiserror_ext::AsReport;
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
+use tokio::{select, time};
 use tracing::Instrument;
 
 use crate::barrier::BarrierManagerRef;
@@ -1598,8 +1600,54 @@ impl DdlController {
             (&stream_job).into(),
         )?;
 
+        //
+        let (local_notification_tx, mut local_notification_rx) =
+            tokio::sync::mpsc::unbounded_channel();
+
+        self.env
+            .notification_manager()
+            .insert_local_sender(local_notification_tx)
+            .await;
+
         // 2. Build the actor graph.
-        let cluster_info = self.metadata_manager.get_streaming_cluster_info().await?;
+        let mut cluster_info = self.metadata_manager.get_streaming_cluster_info().await?;
+
+        if let StreamingJob::MaterializedView(job) = &stream_job
+            && job.backfill_type() == BackfillType::Serverless
+        {
+            // todo
+            let label = format!("materialized_view_{}", id);
+
+            time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let schedulable_worker_ids: HashSet<_> = cluster_info
+                        .worker_nodes
+                        .iter()
+                        .filter(|&(id, worker)| {
+                            worker
+                                .node_label()
+                                .map(|node_label| node_label == label)
+                                .unwrap_or(false)
+                        })
+                        .map(|(id, _)| *id)
+                        .collect();
+
+                    if !schedulable_worker_ids.is_empty() {
+                        return Ok::<(), MetaError>(());
+                    }
+
+                    let notification = local_notification_rx.recv().await.ok_or_else(|| {
+                        anyhow!("local notification channel closed in loop of serverless backfill")
+                    })?;
+
+                    if let LocalNotification::WorkerNodeActivated(w) = notification {
+                        cluster_info = self.metadata_manager.get_streaming_cluster_info().await?;
+                    }
+                }
+            })
+            .await
+            .map_err(|e| anyhow!("timeout {}", e))??;
+        }
 
         let parallelism =
             self.resolve_stream_parallelism(specified_parallelism, max_parallelism, &cluster_info)?;
